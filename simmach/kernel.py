@@ -5,7 +5,7 @@ from dataclasses import dataclass
 import struct
 from typing import Deque, Dict, Optional
 
-from constants import MAP_ANON, MAP_FILE, MAP_FIXED, MAP_SHARED, PROT_EXEC, PROT_READ, PROT_WRITE, Errno, Sysno
+from constants import MAP_ANON, MAP_FILE, MAP_FIXED, MAP_SHARED, O_APPEND, O_CREAT, O_TRUNC, PROT_EXEC, PROT_READ, PROT_WRITE, Errno, Sysno
 from simmach.errors import InvalidAddress
 from simmach.exe import PF_R, PF_W, PF_X, PT_LOAD, parse_exe_v1
 from simmach.exe import REG_REF_MASK
@@ -945,7 +945,7 @@ class Kernel:
         except Exception:
             return int(Errno.EINVAL)
         if inode is None:
-            if flags & 1:
+            if flags & O_CREAT:
                 create_file = getattr(self.fs, "create_file", None)
                 if create_file is None:
                     return int(Errno.ENOENT)
@@ -956,7 +956,7 @@ class Kernel:
             else:
                 return int(Errno.ENOENT)
 
-        if (flags & 4) and not (flags & 2):
+        if (flags & O_TRUNC) and not (flags & O_APPEND):
             # Truncate to 0 on open (like O_TRUNC), unless appending.
             truncate_inode = getattr(self.fs, "truncate_inode", None)
             if truncate_inode is not None:
@@ -969,7 +969,7 @@ class Kernel:
         fd = p.next_fd
         p.next_fd += 1
         off = 0
-        if flags & 2:
+        if flags & O_APPEND:
             off = int(getattr(inode, "size_bytes", 0))
         p.fds[fd] = OpenFile(inode=inode, offset=off)
         return fd

@@ -425,6 +425,34 @@ class BetterFS:
             raise ValueError("not a directory")
         return [n for (n, _) in self._read_dir_entries(inode)]
 
+    def exists(self, path: str) -> bool:
+        return self.lookup(path) is not None
+
+    def read_file(self, path: str) -> bytes:
+        inode = self.lookup(path)
+        if inode is None:
+            raise ValueError("file not found")
+        if inode.is_dir:
+            raise ValueError("is a directory")
+        return self.read_inode(inode, 0, int(inode.size_bytes))
+
+    def write_file(self, path: str, data: bytes, *, create: bool = False, truncate: bool = False, append: bool = False) -> int:
+        inode = self.lookup(path)
+        if inode is None:
+            if not create:
+                raise ValueError("file not found")
+            inode = self.create_file(path)
+        if inode.is_dir:
+            raise ValueError("is a directory")
+
+        if truncate and not append:
+            self.truncate_inode(inode, 0)
+
+        off = 0
+        if append:
+            off = int(inode.size_bytes)
+        return self.write_inode(inode, off, bytes(data), truncate=False)
+
     def read_inode(self, inode: BetterInode, offset: int, count: int) -> bytes:
         if offset < 0 or count < 0:
             raise ValueError("invalid offset/count")

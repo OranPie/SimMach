@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from constants import Sysno
+from constants import O_APPEND, O_CREAT, O_TRUNC, Sysno
 from simmach import rvasm
 from simmach.rvprog import Program
 
@@ -70,6 +70,19 @@ def sys_open(p: Program, *, path_addr: int, flags: int) -> None:
     p.li(A2, 0)
     p.li(A7, int(Sysno.OPEN))
     ecall(p)
+
+
+def sys_open_ro(p: Program, *, path_addr: int) -> None:
+    sys_open(p, path_addr=path_addr, flags=0)
+
+
+def sys_open_create_trunc(p: Program, *, path_addr: int) -> None:
+    sys_open(p, path_addr=path_addr, flags=int(O_CREAT | O_TRUNC))
+
+
+def sys_open_append(p: Program, *, path_addr: int, create: bool = False) -> None:
+    flags = int(O_APPEND | (O_CREAT if create else 0))
+    sys_open(p, path_addr=path_addr, flags=flags)
 
 
 def sys_close(p: Program, *, fd_reg: int = A0) -> None:
