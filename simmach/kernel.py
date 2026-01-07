@@ -533,6 +533,77 @@ class Kernel:
         self.syscalls.register(int(Sysno.PIPE), Kernel._sys_pipe)
         self.syscalls.register(int(Sysno.DUP2), Kernel._sys_dup2)
 
+    def _sys_unlink(self, pid: int, tf: TrapFrame) -> int:
+        if self.fs is None:
+            return int(Errno.EINVAL)
+        path_ptr = int(tf.rdi)
+        try:
+            path_raw = self.read_cstring_from_user(pid, path_ptr)
+            path = self._resolve_path(pid, path_raw)
+            self.fs.unlink(path)
+            return 0
+        except InvalidAddress:
+            return int(Errno.EFAULT)
+        except ValueError:
+            return int(Errno.EINVAL)
+        except Exception:
+            return int(Errno.ENOENT)
+
+    def _sys_rename(self, pid: int, tf: TrapFrame) -> int:
+        if self.fs is None:
+            return int(Errno.EINVAL)
+        old_ptr = int(tf.rdi)
+        new_ptr = int(tf.rsi)
+        try:
+            old_raw = self.read_cstring_from_user(pid, old_ptr)
+            new_raw = self.read_cstring_from_user(pid, new_ptr)
+            old_path = self._resolve_path(pid, old_raw)
+            new_path = self._resolve_path(pid, new_raw)
+            self.fs.rename(old_path, new_path)
+            return 0
+        except InvalidAddress:
+            return int(Errno.EFAULT)
+        except ValueError:
+            return int(Errno.EINVAL)
+        except Exception:
+            return int(Errno.ENOENT)
+
+    def _sys_mkdir(self, pid: int, tf: TrapFrame) -> int:
+        if self.fs is None:
+            return int(Errno.EINVAL)
+        path_ptr = int(tf.rdi)
+        try:
+            path_raw = self.read_cstring_from_user(pid, path_ptr)
+            path = self._resolve_path(pid, path_raw)
+            self.fs.mkdir(path)
+            return 0
+        except InvalidAddress:
+            return int(Errno.EFAULT)
+        except ValueError:
+            return int(Errno.EINVAL)
+        except Exception:
+            return int(Errno.EACCES)
+
+    def _install_syscalls(self) -> None:
+        self.syscalls.register(int(Sysno.EXIT), self._sys_exit)
+        self.syscalls.register(int(Sysno.WRITE), self._sys_write)
+        self.syscalls.register(int(Sysno.READ), self._sys_read)
+        self.syscalls.register(int(Sysno.OPEN), self._sys_open)
+        self.syscalls.register(int(Sysno.CLOSE), self._sys_close)
+        self.syscalls.register(int(Sysno.MMAP), self._sys_mmap)
+        self.syscalls.register(int(Sysno.MUNMAP), self._sys_munmap)
+        self.syscalls.register(int(Sysno.FORK), self._sys_fork)
+        self.syscalls.register(int(Sysno.EXECVE), self._sys_execve)
+        self.syscalls.register(int(Sysno.WAITPID), self._sys_waitpid)
+        self.syscalls.register(int(Sysno.READKEY), self._sys_readkey)
+        self.syscalls.register(int(Sysno.CHDIR), self._sys_chdir)
+        self.syscalls.register(int(Sysno.GETCWD), self._sys_getcwd)
+        self.syscalls.register(int(Sysno.PIPE), self._sys_pipe)
+        self.syscalls.register(int(Sysno.DUP2), self._sys_dup2)
+        self.syscalls.register(int(Sysno.UNLINK), self._sys_unlink)
+        self.syscalls.register(int(Sysno.RENAME), self._sys_rename)
+        self.syscalls.register(int(Sysno.MKDIR), self._sys_mkdir)
+
     def _pipe(self, pipe_id: int) -> Pipe:
         return self._pipes[pipe_id]
 

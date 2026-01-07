@@ -71,6 +71,9 @@ class Sysno(IntEnum):
     GETCWD = 17
     PIPE = 18
     DUP2 = 19
+    UNLINK = 20
+    RENAME = 21
+    MKDIR = 22
 
 
 class CalcOp(IntEnum):

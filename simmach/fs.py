@@ -476,6 +476,80 @@ class BetterFS:
             remaining -= take
         return bytes(out)
 
+    def unlink(self, path: str) -> None:
+        if path == "/":
+            raise ValueError("cannot unlink root")
+        parts = self._split_path(path)
+        parent_path = "/" + "/".join(parts[:-1])
+        leaf = parts[-1]
+
+        parent = self.lookup(parent_path)
+        if parent is None or not parent.is_dir:
+            raise ValueError("parent not found")
+
+        entries = self._read_dir_entries(parent)
+        new_entries = []
+        target_inum = None
+        for n, inum in entries:
+            if n == leaf:
+                target_inum = inum
+            else:
+                new_entries.append((n, inum))
+
+        if target_inum is None:
+            raise ValueError("file not found")
+
+        target = self._get_inode(target_inum)
+        if target.is_dir:
+            # Check if directory is empty
+            if self._read_dir_entries(target):
+                raise ValueError("directory not empty")
+
+        # Free blocks and inode
+        for blk in target.direct:
+            self._free_block(int(blk))
+        self._inode_table[target_inum] = None
+        self._flush_inodes()
+
+        self._write_dir_entries(parent, new_entries)
+
+    def rename(self, old_path: str, new_path: str) -> None:
+        if old_path == "/" or new_path == "/":
+            raise ValueError("cannot rename root")
+        
+        old_inode = self.lookup(old_path)
+        if old_inode is None:
+            raise ValueError("old path not found")
+            
+        # If new_path exists, unlink it first (if it's a file or empty dir)
+        if self.exists(new_path):
+            self.unlink(new_path)
+            
+        # Add to new parent
+        parts = self._split_path(new_path)
+        new_parent_path = "/" + "/".join(parts[:-1])
+        new_leaf = parts[-1]
+        
+        new_parent = self.lookup(new_parent_path)
+        if new_parent is None or not new_parent.is_dir:
+            raise ValueError("new parent not found")
+            
+        # Remove from old parent
+        old_parts = self._split_path(old_path)
+        old_parent_path = "/" + "/".join(old_parts[:-1])
+        old_leaf = old_parts[-1]
+        
+        old_parent = self.lookup(old_parent_path)
+        if old_parent is not None:
+            old_entries = self._read_dir_entries(old_parent)
+            new_old_entries = [(n, inum) for (n, inum) in old_entries if n != old_leaf]
+            self._write_dir_entries(old_parent, new_old_entries)
+            
+        # Add to new parent
+        new_entries = self._read_dir_entries(new_parent)
+        new_entries.append((new_leaf, int(old_inode.inum)))
+        self._write_dir_entries(new_parent, new_entries)
+
     def truncate_inode(self, inode: BetterInode, new_size: int) -> None:
         if new_size < 0:
             raise ValueError("new_size must be non-negative")
