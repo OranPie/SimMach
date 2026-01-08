@@ -59,6 +59,35 @@ def sys_write_reg(p: Program, *, fd_reg: int, buf_reg: int, count_reg: int) -> N
     ecall(p)
 
 
+def sys_write_fd_reg_cnt(p: Program, *, fd: int, buf_reg: int, count: int) -> None:
+    p.li(A0, fd)
+    if buf_reg != A1:
+        p.emit(rvasm.addi(A1, buf_reg, 0))
+    p.li(A2, count)
+    p.li(A7, int(Sysno.WRITE))
+    ecall(p)
+
+
+def sys_write_reg_reg_cnt(p: Program, *, fd_reg: int, buf_reg: int, count: int) -> None:
+    if fd_reg != A0:
+        p.emit(rvasm.addi(A0, fd_reg, 0))
+    if buf_reg != A1:
+        p.emit(rvasm.addi(A1, buf_reg, 0))
+    p.li(A2, count)
+    p.li(A7, int(Sysno.WRITE))
+    ecall(p)
+
+
+def sys_write_fd_reg_reg(p: Program, *, fd: int, buf_reg: int, count_reg: int) -> None:
+    p.li(A0, fd)
+    if buf_reg != A1:
+        p.emit(rvasm.addi(A1, buf_reg, 0))
+    if count_reg != A2:
+        p.emit(rvasm.addi(A2, count_reg, 0))
+    p.li(A7, int(Sysno.WRITE))
+    ecall(p)
+
+
 def sys_read_reg(p: Program, *, fd_reg: int, buf_reg: int, count_reg: int) -> None:
     if fd_reg != A0:
         p.emit(rvasm.addi(A0, fd_reg, 0))
@@ -66,6 +95,25 @@ def sys_read_reg(p: Program, *, fd_reg: int, buf_reg: int, count_reg: int) -> No
         p.emit(rvasm.addi(A1, buf_reg, 0))
     if count_reg != A2:
         p.emit(rvasm.addi(A2, count_reg, 0))
+    p.li(A7, int(Sysno.READ))
+    ecall(p)
+
+
+def sys_read_fd_reg_cnt(p: Program, *, fd: int, buf_reg: int, count: int) -> None:
+    p.li(A0, fd)
+    if buf_reg != A1:
+        p.emit(rvasm.addi(A1, buf_reg, 0))
+    p.li(A2, count)
+    p.li(A7, int(Sysno.READ))
+    ecall(p)
+
+
+def sys_read_reg_reg_cnt(p: Program, *, fd_reg: int, buf_reg: int, count: int) -> None:
+    if fd_reg != A0:
+        p.emit(rvasm.addi(A0, fd_reg, 0))
+    if buf_reg != A1:
+        p.emit(rvasm.addi(A1, buf_reg, 0))
+    p.li(A2, count)
     p.li(A7, int(Sysno.READ))
     ecall(p)
 
@@ -82,6 +130,14 @@ def sys_getcwd_reg(p: Program, *, buf_reg: int, size_reg: int) -> None:
         p.emit(rvasm.addi(A0, buf_reg, 0))
     if size_reg != A1:
         p.emit(rvasm.addi(A1, size_reg, 0))
+    p.li(A7, int(Sysno.GETCWD))
+    ecall(p)
+
+
+def sys_getcwd_reg_cnt(p: Program, *, buf_reg: int, size: int) -> None:
+    if buf_reg != A0:
+        p.emit(rvasm.addi(A0, buf_reg, 0))
+    p.li(A1, size)
     p.li(A7, int(Sysno.GETCWD))
     ecall(p)
 
@@ -163,9 +219,41 @@ def sys_waitpid(p: Program, *, child_pid_reg: int, status_addr: int) -> None:
     ecall(p)
 
 
+def sys_waitpid_reg(p: Program, *, child_pid_reg: int, status_reg: int) -> None:
+    if child_pid_reg != A0:
+        p.emit(rvasm.addi(A0, child_pid_reg, 0))
+    if status_reg != A1:
+        p.emit(rvasm.addi(A1, status_reg, 0))
+    p.li(A7, int(Sysno.WAITPID))
+    ecall(p)
+
+
 def sys_pipe(p: Program, *, pipefd_addr: int) -> None:
     p.li(A0, pipefd_addr)
     p.li(A7, int(Sysno.PIPE))
+    ecall(p)
+
+
+def sys_pipe_reg(p: Program, *, pipefd_reg: int) -> None:
+    if pipefd_reg != A0:
+        p.emit(rvasm.addi(A0, pipefd_reg, 0))
+    p.li(A7, int(Sysno.PIPE))
+    ecall(p)
+
+
+def sys_write(p: Program, *, fd: int, buf: int, count: int) -> None:
+    p.li(A0, fd)
+    p.li(A1, buf)
+    p.li(A2, count)
+    p.li(A7, int(Sysno.WRITE))
+    ecall(p)
+
+
+def sys_read(p: Program, *, fd: int, buf: int, count: int) -> None:
+    p.li(A0, fd)
+    p.li(A1, buf)
+    p.li(A2, count)
+    p.li(A7, int(Sysno.READ))
     ecall(p)
 
 
