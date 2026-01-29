@@ -3,9 +3,26 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass
 import struct
+import time
 from typing import Deque, Dict, Optional
 
-from constants import MAP_ANON, MAP_FILE, MAP_FIXED, MAP_SHARED, O_APPEND, O_CREAT, O_TRUNC, PROT_EXEC, PROT_READ, PROT_WRITE, Errno, Sysno
+from constants import (
+    MAP_ANON,
+    MAP_FILE,
+    MAP_FIXED,
+    MAP_SHARED,
+    O_APPEND,
+    O_CREAT,
+    O_TRUNC,
+    PAGE_SIZE,
+    PROT_EXEC,
+    PROT_READ,
+    PROT_WRITE,
+    STAT_MODE_DIR,
+    STAT_MODE_FILE,
+    Errno,
+    Sysno,
+)
 from simmach.errors import InvalidAddress
 from simmach.exe import PF_R, PF_W, PF_X, PT_LOAD, parse_exe_v1
 from simmach.exe import REG_REF_MASK
@@ -13,10 +30,12 @@ from simmach.fs import TinyFS
 from simmach.io import ConsoleDevice
 from simmach.alu import MemoryALU
 from simmach.mem import AddressSpace, PageFlags
+from simmach.path import norm_path
 from simmach.proc import MmapFileMapping, OpenFile, Process, Thread
 from simmach.riscv import RiscVCPU
 from simmach.rvexe import MAGIC_RVEX_V1, PF_R as RV_PF_R, PF_W as RV_PF_W, PF_X as RV_PF_X, PT_LOAD as RV_PT_LOAD, parse_rvexe_v1
 from simmach.syscall import SyscallTable, TrapFrame
+from structs import Stat
 
 
 @dataclass(slots=True)
@@ -62,32 +81,15 @@ class Kernel:
         self._next_pipe_id = 1
         self._pipes: Dict[int, Pipe] = {}
 
-    @staticmethod
-    def _norm_path(path: str) -> str:
-        if not path:
-            return "/"
-        if not path.startswith("/"):
-            raise ValueError("path must be absolute")
-        parts: list[str] = []
-        for p in path.split("/"):
-            if not p or p == ".":
-                continue
-            if p == "..":
-                if parts:
-                    parts.pop()
-                continue
-            parts.append(p)
-        return "/" + "/".join(parts)
-
     def _resolve_path(self, pid: int, path: str) -> str:
         if not path:
             return self._proc(pid).cwd
         if path.startswith("/"):
-            return self._norm_path(path)
+            return norm_path(path)
         base = self._proc(pid).cwd
         if not base.endswith("/"):
             base += "/"
-        return self._norm_path(base + path)
+        return norm_path(base + path)
 
     def _proc(self, pid: int) -> Process:
         return self.processes[pid]
@@ -514,25 +516,6 @@ class Kernel:
         except Kernel._RvExit:
             return
 
-    def _install_syscalls(self) -> None:
-        self.syscalls.register(int(Sysno.EXIT), Kernel._sys_exit)
-        self.syscalls.register(int(Sysno.YIELD), Kernel._sys_yield)
-        self.syscalls.register(int(Sysno.WRITE), Kernel._sys_write)
-        self.syscalls.register(int(Sysno.OPEN), Kernel._sys_open)
-        self.syscalls.register(int(Sysno.READ), Kernel._sys_read)
-        self.syscalls.register(int(Sysno.CLOSE), Kernel._sys_close)
-        self.syscalls.register(int(Sysno.MMAP), Kernel._sys_mmap)
-        self.syscalls.register(int(Sysno.MUNMAP), Kernel._sys_munmap)
-        self.syscalls.register(int(Sysno.CALC), Kernel._sys_calc)
-        self.syscalls.register(int(Sysno.FORK), Kernel._sys_fork)
-        self.syscalls.register(int(Sysno.EXECVE), Kernel._sys_execve)
-        self.syscalls.register(int(Sysno.WAITPID), Kernel._sys_waitpid)
-        self.syscalls.register(int(Sysno.READKEY), Kernel._sys_readkey)
-        self.syscalls.register(int(Sysno.CHDIR), Kernel._sys_chdir)
-        self.syscalls.register(int(Sysno.GETCWD), Kernel._sys_getcwd)
-        self.syscalls.register(int(Sysno.PIPE), Kernel._sys_pipe)
-        self.syscalls.register(int(Sysno.DUP2), Kernel._sys_dup2)
-
     def _sys_unlink(self, pid: int, tf: TrapFrame) -> int:
         if self.fs is None:
             return int(Errno.EINVAL)
@@ -584,25 +567,134 @@ class Kernel:
         except Exception:
             return int(Errno.EACCES)
 
+    def _sys_gettimeofday(self, pid: int, tf: TrapFrame) -> int:
+        tv_ptr = int(tf.rdi)
+        proc = self.processes.get(pid)
+        if proc is None:
+            return int(Errno.EINVAL)
+        try:
+            now = time.time()
+            sec = int(now)
+            usec = int((now - sec) * 1_000_000)
+            data = struct.pack("<QQ", sec, usec)
+            self.copy_to_user(pid, tv_ptr, data)
+            return 0
+        except InvalidAddress:
+            return int(Errno.EFAULT)
+
+    def _sys_getpid(self, pid: int, tf: TrapFrame) -> int:
+        _ = tf
+        return int(pid)
+
+    def _sys_getppid(self, pid: int, tf: TrapFrame) -> int:
+        _ = tf
+        proc = self.processes.get(pid)
+        if proc is None:
+            return int(Errno.EINVAL)
+        return int(proc.parent_pid)
+
+    def _sys_sleep(self, pid: int, tf: TrapFrame) -> int:
+        _ = pid
+        ms = int(tf.rdi)
+        if ms < 0:
+            return int(Errno.EINVAL)
+        time.sleep(float(ms) / 1000.0)
+        return 0
+
+    def _sys_stat(self, pid: int, tf: TrapFrame) -> int:
+        if self.fs is None:
+            return int(Errno.EINVAL)
+        path_ptr = int(tf.rdi)
+        stat_ptr = int(tf.rsi)
+        try:
+            path_raw = self.read_cstring_from_user(pid, path_ptr)
+        except InvalidAddress:
+            return int(Errno.EFAULT)
+        try:
+            path = self._resolve_path(pid, path_raw)
+        except ValueError:
+            return int(Errno.EINVAL)
+
+        try:
+            inode = self.fs.lookup(path)
+        except Exception:
+            return int(Errno.EINVAL)
+        if inode is None:
+            return int(Errno.ENOENT)
+
+        is_dir = bool(getattr(inode, "is_dir", False))
+        mode = int(STAT_MODE_DIR if is_dir else STAT_MODE_FILE)
+        inum = int(getattr(inode, "inum", 0))
+        size = int(getattr(inode, "size_bytes", 0))
+        st = Stat(mode=mode, inum=inum, size=size)
+        try:
+            self.copy_to_user(pid, stat_ptr, st.to_bytes())
+        except InvalidAddress:
+            return int(Errno.EFAULT)
+        return 0
+
+    def _sys_mprotect(self, pid: int, tf: TrapFrame) -> int:
+        addr = int(tf.rdi)
+        length = int(tf.rsi)
+        prot = int(tf.rdx)
+        if length <= 0:
+            return int(Errno.EINVAL)
+        if addr % PAGE_SIZE != 0:
+            return int(Errno.EINVAL)
+
+        length_aligned = self._page_align_up(length)
+        p = self._proc(pid)
+
+        page_flags = PageFlags.USER
+        if prot & PROT_READ:
+            page_flags |= PageFlags.R
+        if prot & PROT_WRITE:
+            page_flags |= PageFlags.W
+        if prot & PROT_EXEC:
+            page_flags |= PageFlags.X
+        if prot != 0 and not (page_flags & PageFlags.R):
+            page_flags |= PageFlags.R
+
+        end = int(addr + length_aligned)
+        for page_base in range(int(addr), end, PAGE_SIZE):
+            try:
+                _, flags = p.aspace.pagetable.walk(page_base, user=False)
+            except InvalidAddress:
+                return int(Errno.EFAULT)
+            if not (flags & PageFlags.USER):
+                return int(Errno.EFAULT)
+
+        for page_base in range(int(addr), end, PAGE_SIZE):
+            p.aspace.pagetable.protect_page(page_base, page_flags)
+        return 0
+
     def _install_syscalls(self) -> None:
-        self.syscalls.register(int(Sysno.EXIT), self._sys_exit)
-        self.syscalls.register(int(Sysno.WRITE), self._sys_write)
-        self.syscalls.register(int(Sysno.READ), self._sys_read)
-        self.syscalls.register(int(Sysno.OPEN), self._sys_open)
-        self.syscalls.register(int(Sysno.CLOSE), self._sys_close)
-        self.syscalls.register(int(Sysno.MMAP), self._sys_mmap)
-        self.syscalls.register(int(Sysno.MUNMAP), self._sys_munmap)
-        self.syscalls.register(int(Sysno.FORK), self._sys_fork)
-        self.syscalls.register(int(Sysno.EXECVE), self._sys_execve)
-        self.syscalls.register(int(Sysno.WAITPID), self._sys_waitpid)
-        self.syscalls.register(int(Sysno.READKEY), self._sys_readkey)
-        self.syscalls.register(int(Sysno.CHDIR), self._sys_chdir)
-        self.syscalls.register(int(Sysno.GETCWD), self._sys_getcwd)
-        self.syscalls.register(int(Sysno.PIPE), self._sys_pipe)
-        self.syscalls.register(int(Sysno.DUP2), self._sys_dup2)
-        self.syscalls.register(int(Sysno.UNLINK), self._sys_unlink)
-        self.syscalls.register(int(Sysno.RENAME), self._sys_rename)
-        self.syscalls.register(int(Sysno.MKDIR), self._sys_mkdir)
+        self.syscalls.register(int(Sysno.EXIT), Kernel._sys_exit)
+        self.syscalls.register(int(Sysno.YIELD), Kernel._sys_yield)
+        self.syscalls.register(int(Sysno.WRITE), Kernel._sys_write)
+        self.syscalls.register(int(Sysno.READ), Kernel._sys_read)
+        self.syscalls.register(int(Sysno.OPEN), Kernel._sys_open)
+        self.syscalls.register(int(Sysno.CLOSE), Kernel._sys_close)
+        self.syscalls.register(int(Sysno.MMAP), Kernel._sys_mmap)
+        self.syscalls.register(int(Sysno.MUNMAP), Kernel._sys_munmap)
+        self.syscalls.register(int(Sysno.CALC), Kernel._sys_calc)
+        self.syscalls.register(int(Sysno.FORK), Kernel._sys_fork)
+        self.syscalls.register(int(Sysno.EXECVE), Kernel._sys_execve)
+        self.syscalls.register(int(Sysno.WAITPID), Kernel._sys_waitpid)
+        self.syscalls.register(int(Sysno.READKEY), Kernel._sys_readkey)
+        self.syscalls.register(int(Sysno.CHDIR), Kernel._sys_chdir)
+        self.syscalls.register(int(Sysno.GETCWD), Kernel._sys_getcwd)
+        self.syscalls.register(int(Sysno.PIPE), Kernel._sys_pipe)
+        self.syscalls.register(int(Sysno.DUP2), Kernel._sys_dup2)
+        self.syscalls.register(int(Sysno.UNLINK), Kernel._sys_unlink)
+        self.syscalls.register(int(Sysno.RENAME), Kernel._sys_rename)
+        self.syscalls.register(int(Sysno.MKDIR), Kernel._sys_mkdir)
+        self.syscalls.register(int(Sysno.GETTIMEOFDAY), Kernel._sys_gettimeofday)
+        self.syscalls.register(int(Sysno.GETPID), Kernel._sys_getpid)
+        self.syscalls.register(int(Sysno.GETPPID), Kernel._sys_getppid)
+        self.syscalls.register(int(Sysno.SLEEP), Kernel._sys_sleep)
+        self.syscalls.register(int(Sysno.STAT), Kernel._sys_stat)
+        self.syscalls.register(int(Sysno.MPROTECT), Kernel._sys_mprotect)
 
     def _pipe(self, pipe_id: int) -> Pipe:
         return self._pipes[pipe_id]

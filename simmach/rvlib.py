@@ -142,6 +142,64 @@ def sys_getcwd_reg_cnt(p: Program, *, buf_reg: int, size: int) -> None:
     ecall(p)
 
 
+def sys_getpid(p: Program) -> None:
+    p.li(A7, int(Sysno.GETPID))
+    ecall(p)
+
+
+def sys_getppid(p: Program) -> None:
+    p.li(A7, int(Sysno.GETPPID))
+    ecall(p)
+
+
+def sys_sleep(p: Program, *, ms_reg: int) -> None:
+    if ms_reg != A0:
+        p.emit(rvasm.addi(A0, ms_reg, 0))
+    p.li(A7, int(Sysno.SLEEP))
+    ecall(p)
+
+
+def sys_sleep_ms(p: Program, *, ms: int) -> None:
+    p.li(A0, int(ms))
+    p.li(A7, int(Sysno.SLEEP))
+    ecall(p)
+
+
+def sys_stat(p: Program, *, path_addr: int, stat_addr: int) -> None:
+    p.li(A0, int(path_addr))
+    p.li(A1, int(stat_addr))
+    p.li(A7, int(Sysno.STAT))
+    ecall(p)
+
+
+def sys_stat_reg(p: Program, *, path_reg: int, stat_reg: int) -> None:
+    if path_reg != A0:
+        p.emit(rvasm.addi(A0, path_reg, 0))
+    if stat_reg != A1:
+        p.emit(rvasm.addi(A1, stat_reg, 0))
+    p.li(A7, int(Sysno.STAT))
+    ecall(p)
+
+
+def sys_mprotect(p: Program, *, addr_reg: int, len_reg: int, prot_reg: int) -> None:
+    if addr_reg != A0:
+        p.emit(rvasm.addi(A0, addr_reg, 0))
+    if len_reg != A1:
+        p.emit(rvasm.addi(A1, len_reg, 0))
+    if prot_reg != A2:
+        p.emit(rvasm.addi(A2, prot_reg, 0))
+    p.li(A7, int(Sysno.MPROTECT))
+    ecall(p)
+
+
+def sys_mprotect_addr_len_prot(p: Program, *, addr: int, length: int, prot: int) -> None:
+    p.li(A0, int(addr))
+    p.li(A1, int(length))
+    p.li(A2, int(prot))
+    p.li(A7, int(Sysno.MPROTECT))
+    ecall(p)
+
+
 def sys_exit(p: Program, code: int) -> None:
     p.li(A0, code)
     p.li(A7, int(Sysno.EXIT))
@@ -189,6 +247,48 @@ def sys_open_create_trunc_reg(p: Program, *, path_reg: int) -> None:
 def sys_open_append_reg(p: Program, *, path_reg: int, create: bool = False) -> None:
     flags = int(O_APPEND | (O_CREAT if create else 0))
     sys_open_reg(p, path_reg=path_reg, flags=flags)
+
+
+def sys_unlink_reg(p: Program, *, path_reg: int) -> None:
+    if path_reg != A0:
+        p.emit(rvasm.addi(A0, path_reg, 0))
+    p.li(A7, int(Sysno.UNLINK))
+    ecall(p)
+
+
+def sys_unlink(p: Program, *, path_addr: int) -> None:
+    p.li(A0, int(path_addr))
+    p.li(A7, int(Sysno.UNLINK))
+    ecall(p)
+
+
+def sys_rename_reg(p: Program, *, old_reg: int, new_reg: int) -> None:
+    if old_reg != A0:
+        p.emit(rvasm.addi(A0, old_reg, 0))
+    if new_reg != A1:
+        p.emit(rvasm.addi(A1, new_reg, 0))
+    p.li(A7, int(Sysno.RENAME))
+    ecall(p)
+
+
+def sys_rename(p: Program, *, old_addr: int, new_addr: int) -> None:
+    p.li(A0, int(old_addr))
+    p.li(A1, int(new_addr))
+    p.li(A7, int(Sysno.RENAME))
+    ecall(p)
+
+
+def sys_mkdir_reg(p: Program, *, path_reg: int) -> None:
+    if path_reg != A0:
+        p.emit(rvasm.addi(A0, path_reg, 0))
+    p.li(A7, int(Sysno.MKDIR))
+    ecall(p)
+
+
+def sys_mkdir(p: Program, *, path_addr: int) -> None:
+    p.li(A0, int(path_addr))
+    p.li(A7, int(Sysno.MKDIR))
+    ecall(p)
 
 
 def sys_execve_reg(p: Program, *, path_reg: int, argv_reg: int, envp_reg: Optional[int] = None) -> None:
@@ -303,5 +403,3 @@ def sys_mkdir_reg(p: Program, *, path_reg: int) -> None:
         p.emit(rvasm.addi(A0, path_reg, 0))
     p.li(A7, int(Sysno.MKDIR))
     ecall(p)
-
-

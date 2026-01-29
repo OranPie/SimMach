@@ -13,6 +13,7 @@ from constants import (
     MAGIC_HANDLE_TABLE_HEADER,
     MAGIC_OBJECT_HEADER,
     OBJECT_HEADER_SIZE,
+    STAT_SIZE,
     STRING_BODY_SIZE,
 )
 
@@ -210,3 +211,29 @@ class StringBody:
             heap_len=heap_len,
             sso_bytes=sso_bytes,
         )
+
+
+@dataclass(frozen=True, slots=True)
+class Stat:
+    mode: int = 0
+    inum: int = 0
+    size: int = 0
+
+    _STRUCT: ClassVar[struct.Struct] = struct.Struct(f"{LITTLE_ENDIAN}IIQ")
+
+    def to_bytes(self) -> bytes:
+        data = self._STRUCT.pack(
+            _u32(self.mode),
+            _u32(self.inum),
+            _u64(self.size),
+        )
+        if len(data) != STAT_SIZE:
+            raise AssertionError("Stat size mismatch")
+        return data
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> "Stat":
+        if len(data) < STAT_SIZE:
+            raise ValueError("buffer too small for Stat")
+        mode, inum, size = cls._STRUCT.unpack_from(data, 0)
+        return cls(mode=mode, inum=inum, size=size)
