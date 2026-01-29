@@ -2039,6 +2039,10 @@ def _install_base_bins(fs: BetterFS) -> None:
         reg_tok_count=REG_TOK_COUNT,
         reg_cmd_name=REG_CMD_NAME,
         reg_stage_count=REG_STAGE_COUNT,
+        expbuf=expbuf,
+        varcount=varcount,
+        varnames=varnames,
+        varvalues=varvalues,
     )
 
     _gen_sh_exec(
