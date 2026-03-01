@@ -52,9 +52,14 @@ class Program:
             self.data.data += b"\x00" * n
 
     def li(self, rd: int, val: int) -> None:
-        # simple 32-bit immediate load
-        upper = (int(val) + (1 << 11)) >> 12
-        low = int(val) - (upper << 12)
+        val = int(val)
+        # Small values fit in a single addi rd, x0, imm12
+        if -2048 <= val <= 2047:
+            self.emit(rvasm.addi(rd, 0, val))
+            return
+        # Larger values: lui + addi (32-bit range)
+        upper = (val + (1 << 11)) >> 12
+        low = val - (upper << 12)
         self.emit(rvasm.lui(rd, upper & 0xFFFFF))
         self.emit(rvasm.addi(rd, rd, low))
 

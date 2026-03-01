@@ -226,6 +226,22 @@ class RiscVCPU:
                     self._set_reg(rd, a - b)
                     self.pc = _u64(self.pc + 4)
                     return
+                if funct7 == 0x01:  # MUL (RV64M)
+                    self._set_reg(rd, _i64(a) * _i64(b))
+                    self.pc = _u64(self.pc + 4)
+                    return
+
+            if funct3 == 0x4 and funct7 == 0x01:  # DIV (RV64M)
+                divisor = _i64(b)
+                self._set_reg(rd, _i64(a) // divisor if divisor != 0 else -1)
+                self.pc = _u64(self.pc + 4)
+                return
+
+            if funct3 == 0x6 and funct7 == 0x01:  # REM (RV64M)
+                divisor = _i64(b)
+                self._set_reg(rd, _i64(a) % divisor if divisor != 0 else _i64(a))
+                self.pc = _u64(self.pc + 4)
+                return
 
             if funct3 == 0x1 and funct7 == 0x00:  # SLL
                 self._set_reg(rd, _u64(a << (b & 0x3F)))

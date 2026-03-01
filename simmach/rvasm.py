@@ -240,3 +240,39 @@ def srlw(rd: int, rs1: int, rs2: int) -> int:
 
 def sraw(rd: int, rs1: int, rs2: int) -> int:
     return enc_r(0x3B, rd, 0x5, rs1, rs2, 0x20)
+
+
+def sll(rd: int, rs1: int, rs2: int) -> int:
+    return enc_r(0x33, rd, 0x1, rs1, rs2, 0x00)
+
+
+def srl(rd: int, rs1: int, rs2: int) -> int:
+    return enc_r(0x33, rd, 0x5, rs1, rs2, 0x00)
+
+
+def sra(rd: int, rs1: int, rs2: int) -> int:
+    return enc_r(0x33, rd, 0x5, rs1, rs2, 0x20)
+
+
+# RV64M (multiply/divide extension)
+def mul(rd: int, rs1: int, rs2: int) -> int:
+    return enc_r(0x33, rd, 0x0, rs1, rs2, 0x01)
+
+
+def div(rd: int, rs1: int, rs2: int) -> int:
+    return enc_r(0x33, rd, 0x4, rs1, rs2, 0x01)
+
+
+def rem(rd: int, rs1: int, rs2: int) -> int:
+    return enc_r(0x33, rd, 0x6, rs1, rs2, 0x01)
+
+
+# Pseudo-instructions
+def seqz(rd: int, rs: int) -> int:
+    """Set if equal to zero: sltiu rd, rs, 1"""
+    return enc_i(0x13, rd, 0x3, rs, 1)
+
+
+def snez(rd: int, rs: int) -> int:
+    """Set if not equal to zero: sltu rd, x0, rs"""
+    return enc_r(0x33, rd, 0x3, 0, rs, 0x00)
