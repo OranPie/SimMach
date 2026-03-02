@@ -22,6 +22,7 @@ class Process:
     zombie_children: List[int] = field(default_factory=list)
     fds: Dict[int, Union[str, "OpenFile", Any]] = field(default_factory=dict)
     next_fd: int = 3
+    owned_handles: set[int] = field(default_factory=set)
 
     # Per-process mmap bookkeeping (anonymous mappings)
     mmap_base: int = 0x2000_0000
@@ -43,6 +44,7 @@ class MmapFileMapping:
 class OpenFile:
     inode: Any
     offset: int = 0
+    path_handle: int = 0
 
 
 @dataclass(slots=True)

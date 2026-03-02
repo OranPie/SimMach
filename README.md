@@ -72,6 +72,14 @@ python3 -m demos.m15_init_v1_newapi_demo
 
 Other demos are also available in `demos/`.
 
+## Conformance suites
+
+Run the core regression/conformance suites:
+
+```bash
+scripts/test_conformance.sh
+```
+
 ## Notable demos
 
 - `demos.m11_rvx_exec_demo`

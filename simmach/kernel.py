@@ -7,6 +7,7 @@ import time
 from typing import Deque, Dict, Optional
 
 from constants import (
+    HandleType,
     MAP_ANON,
     MAP_FILE,
     MAP_FIXED,
@@ -23,13 +24,14 @@ from constants import (
     Errno,
     Sysno,
 )
-from simmach.errors import InvalidAddress
+from simmach.errors import InvalidAddress, OOMError, PageFault, ResourceLimitError
 from simmach.exe import PF_R, PF_W, PF_X, PT_LOAD, parse_exe_v1
 from simmach.exe import REG_REF_MASK
 from simmach.fs import TinyFS
+from simmach.handle import BytesCodec, CodecRegistry, HandleManager, HandleTable, Int64Codec, StringCodec
 from simmach.io import ConsoleDevice
 from simmach.alu import MemoryALU
-from simmach.mem import AddressSpace, PageFlags
+from simmach.mem import AddressSpace, PageAllocator, PageFlags, ValueHeapAllocator
 from simmach.path import norm_path
 from simmach.proc import MmapFileMapping, OpenFile, Process, Thread
 from simmach.riscv import RiscVCPU
@@ -42,6 +44,12 @@ from structs import Stat
 class KernelConfig:
     stdout_fd: int = 1
     stderr_fd: int = 2
+    enable_handles: bool = True
+    handle_table_base: int = 0x7000_0000
+    handle_table_size_bytes: int = 64 * PAGE_SIZE
+    value_heap_base: int = 0x7100_0000
+    value_heap_size_bytes: int = 512 * PAGE_SIZE
+    max_handles: int = 2048
 
 
 @dataclass(slots=True)
@@ -80,6 +88,102 @@ class Kernel:
 
         self._next_pipe_id = 1
         self._pipes: Dict[int, Pipe] = {}
+
+        self._handle_table: Optional[HandleTable] = None
+        self._handle_manager: Optional[HandleManager] = None
+        if self.config.enable_handles:
+            self._init_handle_subsystem()
+
+    @property
+    def handle_manager(self) -> Optional[HandleManager]:
+        return self._handle_manager
+
+    def _init_handle_subsystem(self) -> None:
+        ht_start = int(self.config.handle_table_base)
+        ht_end = ht_start + int(self.config.handle_table_size_bytes)
+        vh_start = int(self.config.value_heap_base)
+        vh_end = vh_start + int(self.config.value_heap_size_bytes)
+        if not (ht_end <= vh_start or vh_end <= ht_start):
+            raise ValueError("handle table and value heap ranges overlap")
+
+        table_alloc = PageAllocator(
+            self.kernel_aspace,
+            ht_start,
+            int(self.config.handle_table_size_bytes),
+            PageFlags.R | PageFlags.W,
+        )
+        table = HandleTable(self.kernel_aspace, table_alloc)
+        table.attach(max_handles=int(self.config.max_handles))
+
+        heap = ValueHeapAllocator(
+            self.kernel_aspace,
+            vh_start,
+            int(self.config.value_heap_size_bytes),
+            PageFlags.R | PageFlags.W,
+        )
+        bytes_codec = BytesCodec(self.kernel_aspace, heap)
+        registry = CodecRegistry()
+        registry.register(Int64Codec(self.kernel_aspace, heap))
+        registry.register(bytes_codec)
+        registry.register(StringCodec(self.kernel_aspace, heap, bytes_codec))
+        self._handle_table = table
+        self._handle_manager = HandleManager(table, registry)
+
+    def map_syscall_exception(self, exc: Exception) -> int:
+        return int(self._errno_for_exc(exc))
+
+    @staticmethod
+    def _errno_for_exc(exc: Exception, *, default: Errno = Errno.EINVAL) -> int:
+        if isinstance(exc, (InvalidAddress, PageFault)):
+            return int(Errno.EFAULT)
+        if isinstance(exc, (OOMError, ResourceLimitError)):
+            return int(Errno.ENOMEM)
+        if isinstance(exc, ValueError):
+            return int(Errno.EINVAL)
+        return int(default)
+
+    def _alloc_owned_handle(self, pid: int, type_id: int, value: object) -> int:
+        hm = self._handle_manager
+        if hm is None:
+            return 0
+        hid = int(hm.alloc_typed(int(type_id), value, owner_pid=pid))
+        self._proc(pid).owned_handles.add(hid)
+        return hid
+
+    def _free_owned_handle(self, p: Process, handle_id: int) -> None:
+        if handle_id <= 0:
+            return
+        p.owned_handles.discard(int(handle_id))
+        hm = self._handle_manager
+        if hm is None:
+            return
+        try:
+            hm.free(int(handle_id))
+        except Exception:
+            pass
+
+    @staticmethod
+    def _open_file_fd_refs(p: Process, of: OpenFile) -> int:
+        refs = 0
+        for entry in p.fds.values():
+            if entry is of:
+                refs += 1
+        return refs
+
+    def _free_process_handles(self, p: Process) -> None:
+        seen_open_files: set[int] = set()
+        for entry in list(p.fds.values()):
+            if not isinstance(entry, OpenFile):
+                continue
+            oid = id(entry)
+            if oid in seen_open_files:
+                continue
+            seen_open_files.add(oid)
+            if entry.path_handle > 0:
+                self._free_owned_handle(p, int(entry.path_handle))
+                entry.path_handle = 0
+        for hid in list(p.owned_handles):
+            self._free_owned_handle(p, int(hid))
 
     def _resolve_path(self, pid: int, path: str) -> str:
         if not path:
@@ -125,6 +229,9 @@ class Kernel:
 
     def _reap_process(self, pid: int) -> None:
         # Remove process and any threads.
+        p = self.processes.get(pid)
+        if p is not None:
+            self._free_process_handles(p)
         for tid, t in list(self.threads.items()):
             if t.pid == pid:
                 del self.threads[tid]
@@ -149,14 +256,22 @@ class Kernel:
         return tid
 
     def copy_from_user(self, pid: int, user_ptr: int, size: int) -> bytes:
+        if user_ptr < 0:
+            raise InvalidAddress("negative user pointer")
         if size < 0:
             raise ValueError("size must be non-negative")
+        if size > (1 << 30):
+            raise ValueError("copy size too large")
         return self._proc(pid).aspace.read(user_ptr, size, user=True)
 
     def copy_to_user(self, pid: int, user_ptr: int, data: bytes) -> None:
+        if user_ptr < 0:
+            raise InvalidAddress("negative user pointer")
         self._proc(pid).aspace.write(user_ptr, data, user=True)
 
     def read_cstring_from_user(self, pid: int, user_ptr: int, *, max_len: int = 4096) -> str:
+        if user_ptr < 0:
+            raise InvalidAddress("negative user pointer")
         buf = bytearray()
         aspace = self._proc(pid).aspace
         for i in range(max_len):
@@ -814,15 +929,22 @@ class Kernel:
 
         # Release resources eagerly, but keep the Process until it is waited.
         try:
+            seen_open_files: set[int] = set()
             for entry in list(p.fds.values()):
                 if isinstance(entry, PipeEnd):
                     try:
                         self._pipe_decref(entry)
                     except Exception:
                         pass
+                elif isinstance(entry, OpenFile) and id(entry) not in seen_open_files and entry.path_handle > 0:
+                    seen_open_files.add(id(entry))
+                    self._free_owned_handle(p, int(entry.path_handle))
+                    entry.path_handle = 0
             p.fds.clear()
         except Exception:
             pass
+
+        self._free_process_handles(p)
 
         self._writeback_shared_mmaps(p, start=None, end=None)
         p.mmap_regions.clear()
@@ -895,7 +1017,18 @@ class Kernel:
             if entry == "console":
                 child.fds[int(fd)] = "console"
             elif isinstance(entry, OpenFile):
-                child.fds[int(fd)] = OpenFile(inode=entry.inode, offset=int(entry.offset))
+                path_handle = 0
+                if entry.path_handle > 0 and self._handle_manager is not None:
+                    try:
+                        path_value = self._handle_manager.get_typed(int(entry.path_handle))
+                        path_handle = self._alloc_owned_handle(child_pid, int(HandleType.String), str(path_value))
+                    except Exception:
+                        path_handle = 0
+                child.fds[int(fd)] = OpenFile(
+                    inode=entry.inode,
+                    offset=int(entry.offset),
+                    path_handle=path_handle,
+                )
             elif isinstance(entry, PipeEnd):
                 pe = PipeEnd(pipe_id=int(entry.pipe_id), is_read=bool(entry.is_read))
                 child.fds[int(fd)] = pe
@@ -1134,7 +1267,12 @@ class Kernel:
         off = 0
         if flags & O_APPEND:
             off = int(getattr(inode, "size_bytes", 0))
-        p.fds[fd] = OpenFile(inode=inode, offset=off)
+        path_handle = 0
+        try:
+            path_handle = self._alloc_owned_handle(pid, int(HandleType.String), path)
+        except Exception as exc:
+            return int(self._errno_for_exc(exc))
+        p.fds[fd] = OpenFile(inode=inode, offset=off, path_handle=path_handle)
         return fd
 
     def _sys_read(self, pid: int, tf: TrapFrame) -> int:
@@ -1187,6 +1325,9 @@ class Kernel:
         entry = p.fds.get(fd)
         if isinstance(entry, PipeEnd):
             self._pipe_decref(entry)
+        elif isinstance(entry, OpenFile) and entry.path_handle > 0 and self._open_file_fd_refs(p, entry) <= 1:
+            self._free_owned_handle(p, int(entry.path_handle))
+            entry.path_handle = 0
         del p.fds[fd]
         return 0
 

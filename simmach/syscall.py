@@ -31,4 +31,10 @@ class SyscallTable:
         fn = self._handlers.get(int(tf.rax))
         if fn is None:
             return int(Errno.EINVAL)
-        return int(fn(kernel, pid, tf))
+        try:
+            return int(fn(kernel, pid, tf))
+        except Exception as exc:  # Defensive fallback for unhandled kernel errors.
+            mapper = getattr(kernel, "map_syscall_exception", None)
+            if callable(mapper):
+                return int(mapper(exc))
+            return int(Errno.EINVAL)

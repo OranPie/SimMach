@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import struct
 import sys
 import termios
@@ -82,7 +83,14 @@ class _CbreakTerminal:
         except Exception:
             pass
 
-def _run_program(env: ShellEnv, path: str, argv: Sequence[str]) -> int:
+def _run_program(
+    env: ShellEnv,
+    path: str,
+    argv: Sequence[str],
+    *,
+    use_cbreak: bool = True,
+    max_steps: int = 200_000_000,
+) -> int:
     pid = env.k.create_process()
     aspace = env.k.processes[pid].aspace
 
@@ -109,8 +117,9 @@ def _run_program(env: ShellEnv, path: str, argv: Sequence[str]) -> int:
         return int(entry_ret)
 
     try:
-        with _CbreakTerminal():
-            env.k.run_user_rv64(pid, entry_ret, max_steps=200_000_000)
+        guard = _CbreakTerminal() if use_cbreak else contextlib.nullcontext()
+        with guard:
+            env.k.run_user_rv64(pid, entry_ret, max_steps=int(max_steps))
     except KeyboardInterrupt:
         print("\nInterrupted (Ctrl-C).")
     finally:

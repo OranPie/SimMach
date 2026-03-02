@@ -314,14 +314,14 @@ class HandleManager:
         self._table = table
         self._registry = registry
 
-    def alloc_typed(self, type_id: int, value: Any) -> int:
+    def alloc_typed(self, type_id: int, value: Any, *, owner_pid: int = 0) -> int:
         hid = self._table.alloc_handle_id()
         codec = self._registry.get(type_id)
         obj_ptr, obj_len, obj_cap = codec.alloc(value)
         rec = HandleRecord(
             type=int(type_id),
             state=HANDLE_STATE_VALID,
-            owner_pid=0,
+            owner_pid=int(owner_pid),
             refcnt=1,
             obj_ptr=obj_ptr,
             obj_len=obj_len,
@@ -329,6 +329,12 @@ class HandleManager:
         )
         self._table.set_record(hid, rec)
         return hid
+
+    def clone_typed(self, handle_id: int, *, owner_pid: int = 0) -> int:
+        rec = self._table.get_record(handle_id)
+        codec = self._registry.get(int(rec.type))
+        value = codec.decode(rec.obj_ptr, rec)
+        return self.alloc_typed(int(rec.type), value, owner_pid=owner_pid)
 
     def get_typed(self, handle_id: int) -> Any:
         rec = self._table.get_record(handle_id)

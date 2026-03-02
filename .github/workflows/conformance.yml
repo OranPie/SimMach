@@ -1,0 +1,25 @@
+name: Conformance
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  conformance:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Syntax check
+        run: |
+          python -m py_compile $(find . -name "*.py" -not -path "./.git/*")
+
+      - name: Run conformance suites
+        run: |
+          python -m unittest tests.test_conformance_suite tests.test_shell_pipeline_regression tests.test_shell_runtime_integration
