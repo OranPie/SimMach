@@ -17,6 +17,12 @@ class CodegenError(Exception):
     pass
 
 
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+def _fits_imm12(v: int) -> bool:
+    return -2048 <= v <= 2047
+
+
 # ── Constant-fold a binary op on two known integers ─────────────────────────
 
 def _fold_const(op: str, l: int, r: int) -> Optional[int]:
@@ -75,6 +81,79 @@ def _emit_binop(p: Program, op: str, dst: int, lhs: int, rhs: int) -> None:
         p.emit(rvasm.or_(dst, lhs, rhs))
     else:
         raise CodegenError(f"unknown binop {op!r}")
+
+
+def _emit_binop_imm(p: Program, op: str, dst: int, reg: int, imm: int, *, imm_on_rhs: bool) -> bool:
+    """Try emitting reg<op>imm or imm<op>reg directly. Returns True if handled."""
+    if op == "+":
+        if _fits_imm12(imm):
+            p.emit(rvasm.addi(dst, reg, imm))
+            return True
+        return False
+
+    if op == "-" and imm_on_rhs:
+        neg_imm = -imm
+        if _fits_imm12(neg_imm):
+            p.emit(rvasm.addi(dst, reg, neg_imm))
+            return True
+        return False
+
+    if op == "&" and _fits_imm12(imm):
+        p.emit(rvasm.andi(dst, reg, imm))
+        return True
+
+    if op == "|" and _fits_imm12(imm):
+        p.emit(rvasm.ori(dst, reg, imm))
+        return True
+
+    if op == "^" and _fits_imm12(imm):
+        p.emit(rvasm.xori(dst, reg, imm))
+        return True
+
+    if imm_on_rhs and op == "<<":
+        p.emit(rvasm.slli(dst, reg, imm & 63))
+        return True
+
+    if imm_on_rhs and op == ">>":
+        p.emit(rvasm.srli(dst, reg, imm & 63))
+        return True
+
+    # Fast-path comparisons to zero.
+    if imm == 0:
+        if op == "==" and imm_on_rhs:
+            p.emit(rvasm.seqz(dst, reg))
+            return True
+        if op == "!=" and imm_on_rhs:
+            p.emit(rvasm.snez(dst, reg))
+            return True
+        if op == "<":
+            if imm_on_rhs:
+                p.emit(rvasm.slt(dst, reg, ZERO))
+            else:
+                p.emit(rvasm.slt(dst, ZERO, reg))
+            return True
+        if op == ">":
+            if imm_on_rhs:
+                p.emit(rvasm.slt(dst, ZERO, reg))
+            else:
+                p.emit(rvasm.slt(dst, reg, ZERO))
+            return True
+        if op == "<=":
+            if imm_on_rhs:
+                p.emit(rvasm.slt(dst, ZERO, reg))
+            else:
+                p.emit(rvasm.slt(dst, reg, ZERO))
+            p.emit(rvasm.xori(dst, dst, 1))
+            return True
+        if op == ">=":
+            if imm_on_rhs:
+                p.emit(rvasm.slt(dst, reg, ZERO))
+            else:
+                p.emit(rvasm.slt(dst, ZERO, reg))
+            p.emit(rvasm.xori(dst, dst, 1))
+            return True
+
+    return False
 
 
 # ── Per-function code generator ──────────────────────────────────────────────
@@ -239,7 +318,28 @@ class FuncGen:
             return t
 
         if isinstance(expr, BinOp):
-            # Partial constant folding: if one side is constant, fold if possible
+            rv = self._try_const_eval(expr.right)
+            if rv is not None:
+                lhs = self.emit_expr(expr.left)
+                t = ra.next_temp()
+                if _emit_binop_imm(p, expr.op, t, lhs, rv, imm_on_rhs=True):
+                    return t
+                rhs = ra.next_temp()
+                p.li(rhs, rv)
+                _emit_binop(p, expr.op, t, lhs, rhs)
+                return t
+
+            lv = self._try_const_eval(expr.left)
+            if lv is not None:
+                rhs = self.emit_expr(expr.right)
+                t = ra.next_temp()
+                if _emit_binop_imm(p, expr.op, t, rhs, lv, imm_on_rhs=False):
+                    return t
+                lhs = ra.next_temp()
+                p.li(lhs, lv)
+                _emit_binop(p, expr.op, t, lhs, rhs)
+                return t
+
             lhs = self.emit_expr(expr.left)
             rhs = self.emit_expr(expr.right)
             t = ra.next_temp()
@@ -282,6 +382,14 @@ class FuncGen:
             # Comparison → direct branch instruction (no sub+seqz overhead)
             lv = self._try_const_eval(expr.left)
             rv = self._try_const_eval(expr.right)
+            if lv is None and rv == 0:
+                lhs = self.emit_expr(expr.left)
+                if op == "==": p.bne(lhs, ZERO, label); return
+                if op == "!=": p.beq(lhs, ZERO, label); return
+                if op == "<":  p.bge(lhs, ZERO, label); return
+                if op == ">":  p.bge(ZERO, lhs, label); return
+                if op == "<=": p.blt(ZERO, lhs, label); return
+                if op == ">=": p.blt(lhs, ZERO, label); return
             if lv is None and rv is None:
                 lhs = self.emit_expr(expr.left)
                 rhs = self.emit_expr(expr.right)
@@ -323,6 +431,14 @@ class FuncGen:
                 return
             lv = self._try_const_eval(expr.left)
             rv = self._try_const_eval(expr.right)
+            if lv is None and rv == 0:
+                lhs = self.emit_expr(expr.left)
+                if op == "==": p.beq(lhs, ZERO, label); return
+                if op == "!=": p.bne(lhs, ZERO, label); return
+                if op == "<":  p.blt(lhs, ZERO, label); return
+                if op == ">":  p.blt(ZERO, lhs, label); return
+                if op == "<=": p.bge(ZERO, lhs, label); return
+                if op == ">=": p.bge(lhs, ZERO, label); return
             if lv is None and rv is None:
                 lhs = self.emit_expr(expr.left)
                 rhs = self.emit_expr(expr.right)
@@ -370,8 +486,10 @@ class FuncGen:
             raise CodegenError(f"undefined function {call.func!r}")
         if len(call.args) > 6:
             raise CodegenError("more than 6 arguments not supported")
-        for i, ar in enumerate(reversed(arg_regs)):
-            p.emit(rvasm.addi(A0 + (len(arg_regs) - 1 - i), ar, 0))
+        for i, ar in enumerate(arg_regs):
+            dst = A0 + i
+            if ar != dst:
+                p.emit(rvasm.addi(dst, ar, 0))
         p.jal(RA, call.func)
         if dest != A0:
             p.emit(rvasm.addi(dest, A0, 0))
@@ -504,4 +622,3 @@ def codegen(module: Module, p: Optional[Program] = None) -> Program:
         fg.emit()
 
     return p
-

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import struct
 from dataclasses import dataclass
 from enum import IntFlag
 from typing import Dict, Iterable, List, Optional, Tuple
@@ -7,6 +8,10 @@ from typing import Dict, Iterable, List, Optional, Tuple
 from constants import PAGE_SIZE
 from simmach.errors import InvalidAddress, OOMError, PageFault
 from structs import ObjectHeader, VirtAddr
+
+_U16 = struct.Struct("<H")
+_U32 = struct.Struct("<I")
+_U64 = struct.Struct("<Q")
 
 
 def _is_page_aligned(addr: int) -> bool:
@@ -60,12 +65,52 @@ class PhysMem:
             raise InvalidAddress(f"phys read out of range: addr={phys_addr} size={size}")
         return bytes(self._mem[phys_addr : phys_addr + size])
 
+    def read_u8(self, phys_addr: int) -> int:
+        if phys_addr < 0 or phys_addr >= self.size_bytes:
+            raise InvalidAddress(f"phys read out of range: addr={phys_addr} size=1")
+        return int(self._mem[phys_addr])
+
+    def read_u16(self, phys_addr: int) -> int:
+        if phys_addr < 0 or phys_addr + 2 > self.size_bytes:
+            raise InvalidAddress(f"phys read out of range: addr={phys_addr} size=2")
+        return int(_U16.unpack_from(self._mem, phys_addr)[0])
+
+    def read_u32(self, phys_addr: int) -> int:
+        if phys_addr < 0 or phys_addr + 4 > self.size_bytes:
+            raise InvalidAddress(f"phys read out of range: addr={phys_addr} size=4")
+        return int(_U32.unpack_from(self._mem, phys_addr)[0])
+
+    def read_u64(self, phys_addr: int) -> int:
+        if phys_addr < 0 or phys_addr + 8 > self.size_bytes:
+            raise InvalidAddress(f"phys read out of range: addr={phys_addr} size=8")
+        return int(_U64.unpack_from(self._mem, phys_addr)[0])
+
     def write(self, phys_addr: int, data: bytes) -> None:
         if phys_addr < 0 or phys_addr + len(data) > self.size_bytes:
             raise InvalidAddress(
                 f"phys write out of range: addr={phys_addr} size={len(data)}"
             )
         self._mem[phys_addr : phys_addr + len(data)] = data
+
+    def write_u8(self, phys_addr: int, value: int) -> None:
+        if phys_addr < 0 or phys_addr >= self.size_bytes:
+            raise InvalidAddress(f"phys write out of range: addr={phys_addr} size=1")
+        self._mem[phys_addr] = int(value) & 0xFF
+
+    def write_u16(self, phys_addr: int, value: int) -> None:
+        if phys_addr < 0 or phys_addr + 2 > self.size_bytes:
+            raise InvalidAddress(f"phys write out of range: addr={phys_addr} size=2")
+        _U16.pack_into(self._mem, phys_addr, int(value) & 0xFFFF)
+
+    def write_u32(self, phys_addr: int, value: int) -> None:
+        if phys_addr < 0 or phys_addr + 4 > self.size_bytes:
+            raise InvalidAddress(f"phys write out of range: addr={phys_addr} size=4")
+        _U32.pack_into(self._mem, phys_addr, int(value) & 0xFFFF_FFFF)
+
+    def write_u64(self, phys_addr: int, value: int) -> None:
+        if phys_addr < 0 or phys_addr + 8 > self.size_bytes:
+            raise InvalidAddress(f"phys write out of range: addr={phys_addr} size=8")
+        _U64.pack_into(self._mem, phys_addr, int(value) & 0xFFFF_FFFF_FFFF_FFFF)
 
 
 class FrameAllocator:
@@ -190,11 +235,12 @@ class PageTable:
     def walk(self, virt_addr: int, *, write: bool = False, execute: bool = False, user: bool = False) -> Tuple[int, PageFlags]:
         virt_page_base = _align_down(virt_addr)
         if user:
-            cached = self._tlb.get((int(virt_page_base), bool(write), bool(execute), True))
+            key = (int(virt_page_base), write, execute, True)
+            cached = self._tlb.get(key)
             if cached is not None:
                 phys_addr, flags = cached
                 offset = virt_addr - virt_page_base
-                return int(phys_addr + offset), PageFlags(flags)
+                return int(phys_addr + offset), flags
 
         try:
             mapping = self._get_leaf(virt_page_base)
@@ -214,7 +260,7 @@ class PageTable:
         offset = virt_addr - virt_page_base
         phys = int(mapping.phys_page_base)
         if user:
-            self._tlb[(int(virt_page_base), bool(write), bool(execute), True)] = (phys, PageFlags(mapping.flags))
+            self._tlb[(int(virt_page_base), write, execute, True)] = (phys, mapping.flags)
         return phys + offset, mapping.flags
 
     def dump_mappings(self) -> List[Tuple[int, int, PageFlags]]:
@@ -286,11 +332,13 @@ class AddressSpace:
         out = bytearray()
         remaining = size
         cursor = virt_addr
+        walk = self._pt.walk
+        read = self._physmem.read
         while remaining > 0:
-            phys_addr, _ = self._pt.walk(cursor, write=False, execute=False, user=user)
+            phys_addr, _ = walk(cursor, write=False, execute=False, user=user)
             page_off = cursor % PAGE_SIZE
             n = min(remaining, PAGE_SIZE - page_off)
-            out += self._physmem.read(phys_addr, n)
+            out.extend(read(phys_addr, n))
             cursor += n
             remaining -= n
         return bytes(out)
@@ -299,14 +347,53 @@ class AddressSpace:
         remaining = len(data)
         cursor = virt_addr
         src_off = 0
+        walk = self._pt.walk
+        write = self._physmem.write
+        src = memoryview(data)
         while remaining > 0:
-            phys_addr, _ = self._pt.walk(cursor, write=True, execute=False, user=user)
+            phys_addr, _ = walk(cursor, write=True, execute=False, user=user)
             page_off = cursor % PAGE_SIZE
             n = min(remaining, PAGE_SIZE - page_off)
-            self._physmem.write(phys_addr, data[src_off : src_off + n])
+            write(phys_addr, src[src_off : src_off + n])
             cursor += n
             src_off += n
             remaining -= n
+
+    def read_exec_u32(self, virt_addr: int, *, user: bool = False) -> int:
+        phys_addr, _ = self._pt.walk(virt_addr, write=False, execute=True, user=user)
+        return self._physmem.read_u32(phys_addr)
+
+    def read_u8(self, virt_addr: int, *, user: bool = False) -> int:
+        phys_addr, _ = self._pt.walk(virt_addr, write=False, execute=False, user=user)
+        return self._physmem.read_u8(phys_addr)
+
+    def read_u16(self, virt_addr: int, *, user: bool = False) -> int:
+        phys_addr, _ = self._pt.walk(virt_addr, write=False, execute=False, user=user)
+        return self._physmem.read_u16(phys_addr)
+
+    def read_u32(self, virt_addr: int, *, user: bool = False) -> int:
+        phys_addr, _ = self._pt.walk(virt_addr, write=False, execute=False, user=user)
+        return self._physmem.read_u32(phys_addr)
+
+    def read_u64(self, virt_addr: int, *, user: bool = False) -> int:
+        phys_addr, _ = self._pt.walk(virt_addr, write=False, execute=False, user=user)
+        return self._physmem.read_u64(phys_addr)
+
+    def write_u8(self, virt_addr: int, value: int, *, user: bool = False) -> None:
+        phys_addr, _ = self._pt.walk(virt_addr, write=True, execute=False, user=user)
+        self._physmem.write_u8(phys_addr, value)
+
+    def write_u16(self, virt_addr: int, value: int, *, user: bool = False) -> None:
+        phys_addr, _ = self._pt.walk(virt_addr, write=True, execute=False, user=user)
+        self._physmem.write_u16(phys_addr, value)
+
+    def write_u32(self, virt_addr: int, value: int, *, user: bool = False) -> None:
+        phys_addr, _ = self._pt.walk(virt_addr, write=True, execute=False, user=user)
+        self._physmem.write_u32(phys_addr, value)
+
+    def write_u64(self, virt_addr: int, value: int, *, user: bool = False) -> None:
+        phys_addr, _ = self._pt.walk(virt_addr, write=True, execute=False, user=user)
+        self._physmem.write_u64(phys_addr, value)
 
 
 def _coalesce_spans(spans: List[Tuple[int, int]]) -> List[Tuple[int, int]]:

@@ -52,6 +52,7 @@ class Parser:
     def parse(self) -> Module:
         self._skip_newlines()
         consts: List[Const] = []
+        const_env: dict[str, int] = {}
         funcs: List[FuncDef] = []
         while not self._check(TT.EOF):
             self._skip_newlines()
@@ -67,15 +68,17 @@ class Parser:
                 self._advance()  # ASSIGN
                 val_expr = self._parse_expr()
                 self._match(TT.NEWLINE)
-                v = self._const_eval(val_expr, {c.name: c.value for c in consts})
+                v = self._const_eval(val_expr, const_env)
                 if v is None:
                     raise ParseError(f"line {name_tok.line}: module constant must be an integer expression")
-                consts.append(Const(name=name_tok.value, value=v, line=name_tok.line))  # type: ignore[arg-type]
+                name = str(name_tok.value)
+                consts.append(Const(name=name, value=v, line=name_tok.line))
+                const_env[name] = v
             else:
                 raise ParseError(f"line {self._peek().line}: expected 'def' or constant at module level")
         return Module(consts=consts, funcs=funcs)
 
-    def _const_eval(self, expr: Expr, env: dict) -> Optional[int]:
+    def _const_eval(self, expr: Expr, env: dict[str, int]) -> Optional[int]:
         """Evaluate a constant expression at parse time."""
         if isinstance(expr, IntLit):
             return expr.value
@@ -92,10 +95,16 @@ class Parser:
             r = self._const_eval(expr.right, env)
             if l is None or r is None:
                 return None
-            ops = {"+": l+r, "-": l-r, "*": l*r, "&": l&r, "|": l|r, "^": l^r,
-                   "<<": l<<(r&63), ">>": l>>(r&63),
-                   "/": l//r if r else 0, "%": l%r if r else 0}
-            return ops.get(expr.op)
+            if expr.op == "+": return l + r
+            if expr.op == "-": return l - r
+            if expr.op == "*": return l * r
+            if expr.op == "&": return l & r
+            if expr.op == "|": return l | r
+            if expr.op == "^": return l ^ r
+            if expr.op == "<<": return l << (r & 63)
+            if expr.op == ">>": return l >> (r & 63)
+            if expr.op == "/": return l // r if r else 0
+            if expr.op == "%": return l % r if r else 0
         return None
 
     def _parse_funcdef(self) -> FuncDef:
