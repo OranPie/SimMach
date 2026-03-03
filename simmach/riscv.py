@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Dict
 
-from constants import PAGE_SIZE
+from constants import PAGE_SIZE, Sysno
 from simmach.errors import InvalidAddress
 from simmach.mem import AddressSpace
 
@@ -15,6 +15,7 @@ def _u64(x: int) -> int:
 _MASK64 = 0xFFFF_FFFF_FFFF_FFFF
 _PAGE_OFF_MASK = PAGE_SIZE - 1
 _PAGE_MASK = ~_PAGE_OFF_MASK
+_SYSCALLS_THAT_REMAP = frozenset((int(Sysno.MMAP), int(Sysno.MUNMAP), int(Sysno.EXECVE)))
 
 
 def _i64(x: int) -> int:
@@ -86,6 +87,12 @@ class _DecodedInsn:
     imm_u: int
 
 
+@dataclass(slots=True, frozen=True)
+class _Block:
+    start_pc: int
+    insns: tuple[_DecodedInsn, ...]
+
+
 def _decode_insn(insn: int) -> _DecodedInsn:
     i = int(insn)
     return _DecodedInsn(
@@ -110,6 +117,7 @@ class RiscVCPU:
     pc: int
     regs: list[int] = field(default_factory=lambda: [0] * 32)
     _decode_cache: Dict[int, _DecodedInsn] = field(default_factory=dict)
+    _block_cache: Dict[int, _Block] = field(default_factory=dict)
     _ifetch_page: int = -1
     _ifetch_phys: int = 0
     _read_page: int = -1
@@ -122,9 +130,14 @@ class RiscVCPU:
         self._read_page = -1
         self._write_page = -1
 
+    def _clear_code_cache(self) -> None:
+        self._decode_cache.clear()
+        self._block_cache.clear()
+
     def bind_aspace(self, aspace: AddressSpace) -> None:
         self.aspace = aspace
         self._reset_xlate_cache()
+        self._clear_code_cache()
 
     def _translate_exec(self, addr: int) -> int:
         page = int(addr) & _PAGE_MASK
@@ -212,16 +225,31 @@ class RiscVCPU:
             return
         self.regs[rd] = _u64(val)
 
-    def step(self, syscall_cb) -> None:
-        pc = int(self.pc)
+    def _decode_at_pc(self, pc: int) -> _DecodedInsn:
+        insn = int(self._read_u32_exec(int(pc)))
+        d = self._decode_cache.get(int(pc))
+        if d is None or d.insn != insn:
+            d = _decode_insn(insn)
+            self._decode_cache[int(pc)] = d
+        return d
+
+    def _build_block(self, start_pc: int, first: _DecodedInsn) -> _Block:
+        insns: list[_DecodedInsn] = [first]
+        pc = (int(start_pc) + 4) & _MASK64
+        # Stop at control-flow instructions; cap linear block length.
+        for _ in range(63):
+            if insns[-1].opcode in (0x63, 0x6F, 0x67, 0x73):
+                break
+            d = self._decode_at_pc(pc)
+            insns.append(d)
+            pc = (pc + 4) & _MASK64
+        return _Block(start_pc=int(start_pc), insns=tuple(insns))
+
+    def _exec_decoded(self, pc: int, d: _DecodedInsn, syscall_cb) -> None:
+        insn = d.insn
         next_pc = (pc + 4) & _MASK64
         regs = self.regs
         set_reg = self._set_reg
-        insn = int(self._read_u32_exec(pc))
-        d = self._decode_cache.get(pc)
-        if d is None or d.insn != insn:
-            d = _decode_insn(insn)
-            self._decode_cache[pc] = d
         opcode = d.opcode
 
         if opcode == 0x17:  # AUIPC
@@ -553,9 +581,13 @@ class RiscVCPU:
             funct3 = d.funct3
             imm12 = int(insn) >> 20
             if funct3 == 0x0 and imm12 == 0:  # ECALL
+                self.pc = int(pc)
+                sysno = int(regs[17])
                 syscall_cb(self)
-                # Syscalls can remap user pages (mmap/munmap/execve), invalidate translation caches.
-                self._reset_xlate_cache()
+                # Only remapping syscalls invalidate translation/decode caches.
+                if sysno in _SYSCALLS_THAT_REMAP:
+                    self._reset_xlate_cache()
+                    self._clear_code_cache()
                 # Syscall handlers may have adjusted pc (e.g. execve trampoline).
                 self.pc = (int(self.pc) + 4) & _MASK64
                 return
@@ -563,13 +595,48 @@ class RiscVCPU:
 
         raise RuntimeError(f"unsupported opcode={opcode:#x}")
 
+    def step(self, syscall_cb) -> None:
+        pc = int(self.pc)
+        d = self._decode_at_pc(pc)
+        self._exec_decoded(pc, d, syscall_cb)
+
+    def _exec_block(self, block: _Block, syscall_cb, max_steps: int) -> int:
+        consumed = 0
+        pc = int(self.pc)
+        expected_pc = int(block.start_pc)
+        for d in block.insns:
+            if consumed >= int(max_steps):
+                break
+            if int(pc) != int(expected_pc):
+                break
+            self._exec_decoded(pc, d, syscall_cb)
+            consumed += 1
+            new_pc = int(self.pc)
+            next_pc = (pc + 4) & _MASK64
+            if new_pc != next_pc:
+                break
+            pc = new_pc
+            expected_pc = (expected_pc + 4) & _MASK64
+        return consumed
+
     def run(self, syscall_cb, *, max_steps: int = 200_000) -> None:
         regs = self.regs
-        step = self.step
+        remaining = int(max_steps)
         try:
-            for _ in range(int(max_steps)):
+            while remaining > 0:
                 regs[0] = 0
-                step(syscall_cb)
+                pc = int(self.pc)
+                first = self._decode_at_pc(pc)
+                block = self._block_cache.get(pc)
+                if block is None or block.insns[0].insn != first.insn:
+                    block = self._build_block(pc, first)
+                    self._block_cache[pc] = block
+                n = self._exec_block(block, syscall_cb, remaining)
+                if n <= 0:
+                    # Defensive fallback; should not happen.
+                    self.step(syscall_cb)
+                    n = 1
+                remaining -= n
         except InvalidAddress:
             raise
         raise RuntimeError("rv64 program did not finish")
