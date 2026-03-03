@@ -527,6 +527,10 @@ class Kernel:
     def run_user_rv64(self, pid: int, entry: int, *, max_steps: int = 200_000) -> None:
         p = self._proc(pid)
         cpu = RiscVCPU(p.aspace, pc=int(entry))
+        sys_dispatch = self.syscalls.dispatch
+        sys_execve = int(Sysno.EXECVE)
+        sys_fork = int(Sysno.FORK)
+        sys_exit = int(Sysno.EXIT)
         if p.start_rsp is not None:
             cpu.regs[2] = int(p.start_rsp)
         if p.start_a0 is not None:
@@ -535,95 +539,87 @@ class Kernel:
             cpu.regs[11] = int(p.start_a1)
         if p.start_a2 is not None:
             cpu.regs[12] = int(p.start_a2)
+        tf = TrapFrame()
 
         def _syscall(cpu: RiscVCPU) -> None:
-            regs_before = list(cpu.regs)
-            a0 = int(cpu.regs[10])
-            a1 = int(cpu.regs[11])
-            a2 = int(cpu.regs[12])
-            a3 = int(cpu.regs[13])
-            a4 = int(cpu.regs[14])
-            a5 = int(cpu.regs[15])
-            a7 = int(cpu.regs[17])
+            regs = cpu.regs
+            a7 = int(regs[17])
+            tf.rax = a7
+            tf.rdi = int(regs[10])
+            tf.rsi = int(regs[11])
+            tf.rdx = int(regs[12])
+            tf.r10 = int(regs[13])
+            tf.r8 = int(regs[14])
+            tf.r9 = int(regs[15])
+            ret = int(sys_dispatch(self, pid, tf))
 
-            tf = TrapFrame(
-                rax=int(a7),
-                rdi=int(a0),
-                rsi=int(a1),
-                rdx=int(a2),
-                r10=int(a3),
-                r8=int(a4),
-                r9=int(a5),
-            )
-            ret = int(self.syscalls.dispatch(self, pid, tf))
-            cpu.regs[10] = int(ret)
+            regs_before: Optional[list[int]] = None
+            if a7 == sys_fork and ret > 0:
+                regs_before = list(regs)
+            regs[10] = ret
 
             # execve replaces the process AddressSpace; the CPU must switch to it.
             # Note: the RV interpreter increments PC by +4 after this callback returns,
             # so we set pc=(entry-4) here to land exactly on entry.
-            if a7 == int(Sysno.EXECVE) and ret > 0:
+            if a7 == sys_execve and ret > 0:
                 np = self._proc(pid)
-                cpu.aspace = np.aspace
+                cpu.bind_aspace(np.aspace)
                 if np.start_rsp is not None:
-                    cpu.regs[2] = int(np.start_rsp)
+                    regs[2] = int(np.start_rsp)
                 if np.start_a0 is not None:
-                    cpu.regs[10] = int(np.start_a0)
+                    regs[10] = int(np.start_a0)
                 if np.start_a1 is not None:
-                    cpu.regs[11] = int(np.start_a1)
+                    regs[11] = int(np.start_a1)
                 if np.start_a2 is not None:
-                    cpu.regs[12] = int(np.start_a2)
+                    regs[12] = int(np.start_a2)
                 cpu.pc = int(ret) - 4
 
-            if a7 == int(Sysno.FORK) and ret > 0:
+            if a7 == sys_fork and ret > 0:
+                if regs_before is None:
+                    regs_before = list(regs)
                 child_pid = int(ret)
                 child_proc = self._proc(child_pid)
                 child_cpu = RiscVCPU(child_proc.aspace, pc=int(cpu.pc + 4))
-                child_cpu.regs = list(regs_before)
+                child_cpu.regs = regs_before
                 child_cpu.regs[10] = 0
                 if child_proc.start_rsp is not None:
                     child_cpu.regs[2] = int(child_proc.start_rsp)
+                child_tf = TrapFrame()
 
                 def _child_syscall(child_cpu: RiscVCPU) -> None:
-                    ca0 = int(child_cpu.regs[10])
-                    ca1 = int(child_cpu.regs[11])
-                    ca2 = int(child_cpu.regs[12])
-                    ca3 = int(child_cpu.regs[13])
-                    ca4 = int(child_cpu.regs[14])
-                    ca5 = int(child_cpu.regs[15])
-                    ca7 = int(child_cpu.regs[17])
-                    ctf = TrapFrame(
-                        rax=int(ca7),
-                        rdi=int(ca0),
-                        rsi=int(ca1),
-                        rdx=int(ca2),
-                        r10=int(ca3),
-                        r8=int(ca4),
-                        r9=int(ca5),
-                    )
-                    cret = int(self.syscalls.dispatch(self, child_pid, ctf))
-                    child_cpu.regs[10] = int(cret)
+                    cregs = child_cpu.regs
+                    ca7 = int(cregs[17])
+                    child_tf.rax = ca7
+                    child_tf.rdi = int(cregs[10])
+                    child_tf.rsi = int(cregs[11])
+                    child_tf.rdx = int(cregs[12])
+                    child_tf.r10 = int(cregs[13])
+                    child_tf.r8 = int(cregs[14])
+                    child_tf.r9 = int(cregs[15])
+                    cret = int(sys_dispatch(self, child_pid, child_tf))
+                    cregs[10] = int(cret)
 
-                    if ca7 == int(Sysno.EXECVE) and cret > 0:
+                    if ca7 == sys_execve and cret > 0:
                         cp = self._proc(child_pid)
-                        child_cpu.aspace = cp.aspace
+                        child_cpu.bind_aspace(cp.aspace)
                         if cp.start_rsp is not None:
-                            child_cpu.regs[2] = int(cp.start_rsp)
+                            cregs[2] = int(cp.start_rsp)
                         if cp.start_a0 is not None:
-                            child_cpu.regs[10] = int(cp.start_a0)
+                            cregs[10] = int(cp.start_a0)
                         if cp.start_a1 is not None:
-                            child_cpu.regs[11] = int(cp.start_a1)
+                            cregs[11] = int(cp.start_a1)
                         if cp.start_a2 is not None:
-                            child_cpu.regs[12] = int(cp.start_a2)
+                            cregs[12] = int(cp.start_a2)
                         child_cpu.pc = int(cret) - 4
 
-                    if ca7 == int(Sysno.EXIT) and self.processes[child_pid].exit_status is not None:
+                    if ca7 == sys_exit and self.processes[child_pid].exit_status is not None:
                         raise Kernel._RvExit()
 
                 try:
                     child_cpu.run(_child_syscall, max_steps=max_steps)
                 except Kernel._RvExit:
                     pass
-            if a7 == int(Sysno.EXIT) and self.processes[pid].exit_status is not None:
+            if a7 == sys_exit and self.processes[pid].exit_status is not None:
                 raise Kernel._RvExit()
 
         try:

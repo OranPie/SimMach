@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Dict
 
+from constants import PAGE_SIZE
 from simmach.errors import InvalidAddress
 from simmach.mem import AddressSpace
 
@@ -11,6 +13,8 @@ def _u64(x: int) -> int:
 
 
 _MASK64 = 0xFFFF_FFFF_FFFF_FFFF
+_PAGE_OFF_MASK = PAGE_SIZE - 1
+_PAGE_MASK = ~_PAGE_OFF_MASK
 
 
 def _i64(x: int) -> int:
@@ -66,53 +70,142 @@ def _imm_j(insn: int) -> int:
     return _sign_extend(imm, 21)
 
 
+@dataclass(slots=True, frozen=True)
+class _DecodedInsn:
+    insn: int
+    opcode: int
+    rd: int
+    funct3: int
+    rs1: int
+    rs2: int
+    funct7: int
+    imm_i: int
+    imm_s: int
+    imm_b: int
+    imm_j: int
+    imm_u: int
+
+
+def _decode_insn(insn: int) -> _DecodedInsn:
+    i = int(insn)
+    return _DecodedInsn(
+        insn=i,
+        opcode=i & 0x7F,
+        rd=(i >> 7) & 0x1F,
+        funct3=(i >> 12) & 0x7,
+        rs1=(i >> 15) & 0x1F,
+        rs2=(i >> 20) & 0x1F,
+        funct7=(i >> 25) & 0x7F,
+        imm_i=_imm_i(i),
+        imm_s=_imm_s(i),
+        imm_b=_imm_b(i),
+        imm_j=_imm_j(i),
+        imm_u=_imm_u(i),
+    )
+
+
 @dataclass(slots=True)
 class RiscVCPU:
     aspace: AddressSpace
     pc: int
     regs: list[int] = field(default_factory=lambda: [0] * 32)
+    _decode_cache: Dict[int, _DecodedInsn] = field(default_factory=dict)
+    _ifetch_page: int = -1
+    _ifetch_phys: int = 0
+    _read_page: int = -1
+    _read_phys: int = 0
+    _write_page: int = -1
+    _write_phys: int = 0
+
+    def _reset_xlate_cache(self) -> None:
+        self._ifetch_page = -1
+        self._read_page = -1
+        self._write_page = -1
+
+    def bind_aspace(self, aspace: AddressSpace) -> None:
+        self.aspace = aspace
+        self._reset_xlate_cache()
+
+    def _translate_exec(self, addr: int) -> int:
+        page = int(addr) & _PAGE_MASK
+        off = int(addr) & _PAGE_OFF_MASK
+        if page == self._ifetch_page:
+            return self._ifetch_phys + off
+        phys_addr, _ = self.aspace.pagetable.walk(int(addr), execute=True, user=True)
+        self._ifetch_page = page
+        self._ifetch_phys = int(phys_addr) - off
+        return int(phys_addr)
+
+    def _translate_read(self, addr: int) -> int:
+        page = int(addr) & _PAGE_MASK
+        off = int(addr) & _PAGE_OFF_MASK
+        if page == self._read_page:
+            return self._read_phys + off
+        phys_addr, _ = self.aspace.pagetable.walk(int(addr), write=False, execute=False, user=True)
+        self._read_page = page
+        self._read_phys = int(phys_addr) - off
+        return int(phys_addr)
+
+    def _translate_write(self, addr: int) -> int:
+        page = int(addr) & _PAGE_MASK
+        off = int(addr) & _PAGE_OFF_MASK
+        if page == self._write_page:
+            return self._write_phys + off
+        phys_addr, _ = self.aspace.pagetable.walk(int(addr), write=True, execute=False, user=True)
+        self._write_page = page
+        self._write_phys = int(phys_addr) - off
+        return int(phys_addr)
 
     def _read_u32_exec(self, addr: int) -> int:
         # Instruction fetch should require X permission.
         if (int(addr) & 3) != 0:
             raise InvalidAddress("misaligned instruction fetch")
-        return int(self.aspace.read_exec_u32(int(addr), user=True))
+        phys_addr = self._translate_exec(int(addr))
+        return int(self.aspace.physmem.read_u32(int(phys_addr)))
 
     def _read_u8(self, addr: int) -> int:
-        return int(self.aspace.read_u8(int(addr), user=True))
+        phys_addr = self._translate_read(int(addr))
+        return int(self.aspace.physmem.read_u8(int(phys_addr)))
 
     def _read_u16(self, addr: int) -> int:
         if (int(addr) & 1) != 0:
             raise InvalidAddress("misaligned halfword load")
-        return int(self.aspace.read_u16(int(addr), user=True))
+        phys_addr = self._translate_read(int(addr))
+        return int(self.aspace.physmem.read_u16(int(phys_addr)))
 
     def _read_u32(self, addr: int) -> int:
         if (int(addr) & 3) != 0:
             raise InvalidAddress("misaligned word load")
-        return int(self.aspace.read_u32(int(addr), user=True))
+        phys_addr = self._translate_read(int(addr))
+        return int(self.aspace.physmem.read_u32(int(phys_addr)))
 
     def _read_u64(self, addr: int) -> int:
         if (int(addr) & 7) != 0:
             raise InvalidAddress("misaligned doubleword load")
-        return int(self.aspace.read_u64(int(addr), user=True))
+        phys_addr = self._translate_read(int(addr))
+        return int(self.aspace.physmem.read_u64(int(phys_addr)))
 
     def _write_u8(self, addr: int, val: int) -> None:
-        self.aspace.write_u8(int(addr), int(val), user=True)
+        phys_addr = self._translate_write(int(addr))
+        self.aspace.physmem.write_u8(int(phys_addr), int(val))
 
     def _write_u16(self, addr: int, val: int) -> None:
         if (int(addr) & 1) != 0:
             raise InvalidAddress("misaligned halfword store")
-        self.aspace.write_u16(int(addr), int(val), user=True)
+        phys_addr = self._translate_write(int(addr))
+        self.aspace.physmem.write_u16(int(phys_addr), int(val))
 
     def _write_u32(self, addr: int, val: int) -> None:
         if (int(addr) & 3) != 0:
             raise InvalidAddress("misaligned word store")
-        self.aspace.write_u32(int(addr), int(val), user=True)
+        phys_addr = self._translate_write(int(addr))
+        self.aspace.physmem.write_u32(int(phys_addr), int(val))
 
     def _write_u64(self, addr: int, val: int) -> None:
         if (int(addr) & 7) != 0:
             raise InvalidAddress("misaligned doubleword store")
-        self.aspace.write_u64(int(addr), int(val), user=True)
+        phys_addr = self._translate_write(int(addr))
+        self.aspace.physmem.write_u64(int(phys_addr), int(val))
 
     def _set_reg(self, rd: int, val: int) -> None:
         if rd == 0:
@@ -124,27 +217,28 @@ class RiscVCPU:
         next_pc = (pc + 4) & _MASK64
         regs = self.regs
         set_reg = self._set_reg
-        insn = self._read_u32_exec(pc)
-        opcode = int(insn) & 0x7F
+        insn = int(self._read_u32_exec(pc))
+        d = self._decode_cache.get(pc)
+        if d is None or d.insn != insn:
+            d = _decode_insn(insn)
+            self._decode_cache[pc] = d
+        opcode = d.opcode
 
         if opcode == 0x17:  # AUIPC
-            rd = (int(insn) >> 7) & 0x1F
-            imm = _imm_u(insn)
-            set_reg(rd, pc + int(imm))
+            set_reg(d.rd, pc + int(d.imm_u))
             self.pc = next_pc
             return
 
         if opcode == 0x37:  # LUI
-            rd = (int(insn) >> 7) & 0x1F
-            set_reg(rd, _imm_u(insn))
+            set_reg(d.rd, d.imm_u)
             self.pc = next_pc
             return
 
         if opcode == 0x13:  # OP-IMM
-            rd = (int(insn) >> 7) & 0x1F
-            funct3 = (int(insn) >> 12) & 0x7
-            rs1 = (int(insn) >> 15) & 0x1F
-            imm = _imm_i(insn)
+            rd = d.rd
+            funct3 = d.funct3
+            rs1 = d.rs1
+            imm = d.imm_i
 
             if funct3 == 0x0:  # ADDI
                 set_reg(rd, int(regs[rs1]) + int(imm))
@@ -177,14 +271,14 @@ class RiscVCPU:
                 return
 
             if funct3 == 0x1:  # SLLI
-                shamt = (int(insn) >> 20) & 0x3F
+                shamt = (insn >> 20) & 0x3F
                 set_reg(rd, int(regs[rs1]) << shamt)
                 self.pc = next_pc
                 return
 
             if funct3 == 0x5:
-                shamt = (int(insn) >> 20) & 0x3F
-                funct7 = (int(insn) >> 25) & 0x7F
+                shamt = (insn >> 20) & 0x3F
+                funct7 = d.funct7
                 if funct7 == 0x00:  # SRLI
                     set_reg(rd, _u64(regs[rs1]) >> shamt)
                     self.pc = next_pc
@@ -198,11 +292,11 @@ class RiscVCPU:
             raise RuntimeError(f"unsupported OP-IMM funct3={funct3}")
 
         if opcode == 0x33:  # OP
-            rd = (int(insn) >> 7) & 0x1F
-            funct3 = (int(insn) >> 12) & 0x7
-            rs1 = (int(insn) >> 15) & 0x1F
-            rs2 = (int(insn) >> 20) & 0x1F
-            funct7 = (int(insn) >> 25) & 0x7F
+            rd = d.rd
+            funct3 = d.funct3
+            rs1 = d.rs1
+            rs2 = d.rs2
+            funct7 = d.funct7
 
             a = int(regs[rs1])
             b = int(regs[rs2])
@@ -278,10 +372,10 @@ class RiscVCPU:
             )
 
         if opcode == 0x1B:  # OP-IMM-32
-            rd = (int(insn) >> 7) & 0x1F
-            funct3 = (int(insn) >> 12) & 0x7
-            rs1 = (int(insn) >> 15) & 0x1F
-            imm = _imm_i(insn)
+            rd = d.rd
+            funct3 = d.funct3
+            rs1 = d.rs1
+            imm = d.imm_i
 
             if funct3 == 0x0:  # ADDIW
                 set_reg(rd, _sext32(_sext32(regs[rs1]) + int(imm)))
@@ -289,14 +383,14 @@ class RiscVCPU:
                 return
 
             if funct3 == 0x1:  # SLLIW
-                shamt = (int(insn) >> 20) & 0x1F
+                shamt = d.rs2 & 0x1F
                 set_reg(rd, _sext32((int(regs[rs1]) & 0xFFFF_FFFF) << shamt))
                 self.pc = next_pc
                 return
 
             if funct3 == 0x5:
-                shamt = (int(insn) >> 20) & 0x1F
-                funct7 = (int(insn) >> 25) & 0x7F
+                shamt = d.rs2 & 0x1F
+                funct7 = d.funct7
                 if funct7 == 0x00:  # SRLIW
                     v = (int(regs[rs1]) & 0xFFFF_FFFF) >> shamt
                     set_reg(rd, _sext32(v))
@@ -311,11 +405,11 @@ class RiscVCPU:
             raise RuntimeError("unsupported OP-IMM-32")
 
         if opcode == 0x3B:  # OP-32
-            rd = (int(insn) >> 7) & 0x1F
-            funct3 = (int(insn) >> 12) & 0x7
-            rs1 = (int(insn) >> 15) & 0x1F
-            rs2 = (int(insn) >> 20) & 0x1F
-            funct7 = (int(insn) >> 25) & 0x7F
+            rd = d.rd
+            funct3 = d.funct3
+            rs1 = d.rs1
+            rs2 = d.rs2
+            funct7 = d.funct7
 
             a = int(regs[rs1])
             b = int(regs[rs2])
@@ -350,10 +444,10 @@ class RiscVCPU:
             raise RuntimeError("unsupported OP-32")
 
         if opcode == 0x03:  # LOAD
-            rd = (int(insn) >> 7) & 0x1F
-            funct3 = (int(insn) >> 12) & 0x7
-            rs1 = (int(insn) >> 15) & 0x1F
-            imm = _imm_i(insn)
+            rd = d.rd
+            funct3 = d.funct3
+            rs1 = d.rs1
+            imm = d.imm_i
             addr = (int(regs[rs1]) + int(imm)) & _MASK64
 
             if funct3 == 0x0:  # LB
@@ -388,10 +482,10 @@ class RiscVCPU:
             raise RuntimeError("unsupported LOAD")
 
         if opcode == 0x23:  # STORE
-            funct3 = (int(insn) >> 12) & 0x7
-            rs1 = (int(insn) >> 15) & 0x1F
-            rs2 = (int(insn) >> 20) & 0x1F
-            imm = _imm_s(insn)
+            funct3 = d.funct3
+            rs1 = d.rs1
+            rs2 = d.rs2
+            imm = d.imm_s
             addr = (int(regs[rs1]) + int(imm)) & _MASK64
             v = int(regs[rs2])
 
@@ -415,10 +509,10 @@ class RiscVCPU:
             raise RuntimeError("unsupported STORE")
 
         if opcode == 0x63:  # BRANCH
-            funct3 = (int(insn) >> 12) & 0x7
-            rs1 = (int(insn) >> 15) & 0x1F
-            rs2 = (int(insn) >> 20) & 0x1F
-            imm = _imm_b(insn)
+            funct3 = d.funct3
+            rs1 = d.rs1
+            rs2 = d.rs2
+            imm = d.imm_b
 
             taken = False
             if funct3 == 0x0:  # BEQ
@@ -440,27 +534,28 @@ class RiscVCPU:
             return
 
         if opcode == 0x6F:  # JAL
-            rd = (int(insn) >> 7) & 0x1F
-            set_reg(rd, next_pc)
-            self.pc = (pc + int(_imm_j(insn))) & _MASK64
+            set_reg(d.rd, next_pc)
+            self.pc = (pc + int(d.imm_j)) & _MASK64
             return
 
         if opcode == 0x67:  # JALR
-            rd = (int(insn) >> 7) & 0x1F
-            funct3 = (int(insn) >> 12) & 0x7
-            rs1 = (int(insn) >> 15) & 0x1F
+            rd = d.rd
+            funct3 = d.funct3
+            rs1 = d.rs1
             if funct3 != 0x0:
                 raise RuntimeError(f"unsupported JALR funct3={funct3}")
-            target = ((int(regs[rs1]) + int(_imm_i(insn))) & _MASK64) & ~1
+            target = ((int(regs[rs1]) + int(d.imm_i)) & _MASK64) & ~1
             set_reg(rd, next_pc)
             self.pc = target
             return
 
         if opcode == 0x73:  # SYSTEM
-            funct3 = (int(insn) >> 12) & 0x7
-            imm12 = (int(insn) >> 20) & 0xFFF
+            funct3 = d.funct3
+            imm12 = int(insn) >> 20
             if funct3 == 0x0 and imm12 == 0:  # ECALL
                 syscall_cb(self)
+                # Syscalls can remap user pages (mmap/munmap/execve), invalidate translation caches.
+                self._reset_xlate_cache()
                 # Syscall handlers may have adjusted pc (e.g. execve trampoline).
                 self.pc = (int(self.pc) + 4) & _MASK64
                 return
